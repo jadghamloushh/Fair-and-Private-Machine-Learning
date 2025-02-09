@@ -319,10 +319,10 @@ def main():
     print(f"Generated seeds for runs: {run_seeds}")
 
     # Hyperparameters
-    BATCH_SIZE = 4000
+    BATCH_SIZE = 5000
     EPOCHS = 11
     LEARNING_RATE = 0.005
-    NOISE_MULTIPLIER = 8
+    NOISE_MULTIPLIER = 4
     MAX_GRAD_NORM = 1
     TARGET_DELTA = 1e-5
 

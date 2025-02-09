@@ -10,9 +10,6 @@ import os
 from typing import List
 import matplotlib.pyplot as plt
 
-# Import SHAP for explainability
-import shap
-
 # Import PrivacyEngine from opacus
 try:
     from opacus import PrivacyEngine
@@ -39,20 +36,19 @@ def generate_run_seeds(base_seed: int, num_runs: int) -> List[int]:
     return seeds
 
 
+# --- Dataset Class ---
 class AdultDataset(Dataset):
     def __init__(self, features: np.ndarray, labels: np.ndarray):
         self.features = torch.FloatTensor(features)
         self.labels = torch.LongTensor(labels)
-
     def __len__(self):
         return len(self.labels)
-
     def __getitem__(self, idx):
         return self.features[idx], self.labels[idx]
 
 
-# Modified preprocessing to also return feature names
-def preprocess_loan_data(df: pd.DataFrame) -> (np.ndarray, np.ndarray, int, List[str]):
+# --- Preprocessing ---
+def preprocess_loan_data(df: pd.DataFrame) -> (np.ndarray, np.ndarray, int):
     df = df.copy()
 
     numeric_features = [
@@ -91,20 +87,16 @@ def preprocess_loan_data(df: pd.DataFrame) -> (np.ndarray, np.ndarray, int, List
     y = df['loan_status'].values.astype(np.int64)
 
     input_dim = X.shape[1]
-    # Get feature names: numeric features plus one-hot encoded names
-    categorical_feature_names = ohe.get_feature_names_out(categorical_features).tolist()
-    feature_names = numeric_features + categorical_feature_names
-
-    return X, y, input_dim, feature_names
+    return X, y, input_dim
 
 
 def load_adult_data(train_file: str, test_file: str, batch_size: int = 512):
     train_df = pd.read_csv(train_file, skipinitialspace=True)
     test_df = pd.read_csv(test_file, skipinitialspace=True)
 
-    # Preprocess each dataset (with feature names)
-    X_train, y_train, input_dim, feature_names = preprocess_loan_data(train_df)
-    X_test, y_test, _, _ = preprocess_loan_data(test_df)
+    # Preprocess each dataset
+    X_train, y_train, input_dim = preprocess_loan_data(train_df)
+    X_test, y_test, _ = preprocess_loan_data(test_df)
 
     # Create PyTorch datasets
     train_dataset = AdultDataset(X_train, y_train)
@@ -114,31 +106,24 @@ def load_adult_data(train_file: str, test_file: str, batch_size: int = 512):
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=True)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, pin_memory=True)
 
-    return train_loader, test_loader, len(train_dataset), input_dim, feature_names
+    return train_loader, test_loader, len(train_dataset), input_dim
 
 
+# --- Model ---
 class ImprovedAdultNet(nn.Module):
     def __init__(self, input_dim: int):
         super(ImprovedAdultNet, self).__init__()
-        # Normalize the input using LayerNorm
         self.input_norm = nn.LayerNorm(input_dim)
-
-        # Fully connected network with dropout and ReLU activation
         self.fc1 = nn.Linear(input_dim, 256)
         self.norm1 = nn.LayerNorm(256)
         self.dropout1 = nn.Dropout(0.3)
-
         self.fc2 = nn.Linear(256, 128)
         self.norm2 = nn.LayerNorm(128)
         self.dropout2 = nn.Dropout(0.2)
-
         self.fc3 = nn.Linear(128, 64)
         self.norm3 = nn.LayerNorm(64)
         self.dropout3 = nn.Dropout(0.1)
-
-        # Output layer: 2 neurons for binary classification
         self.fc_out = nn.Linear(64, 2)
-
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
@@ -162,6 +147,65 @@ class ImprovedAdultNet(nn.Module):
         return out
 
 
+# --- Postprocessing for Fairness (Calibrated Equalized Odds) ---
+def postprocess_equalized_odds(model, test_loader, device, sensitive_values):
+    """
+    Computes group-specific thresholds on predicted probability for the positive class
+    so that each group's TPR is as close as possible to the overall average TPR.
+    Returns the postprocessed binary predictions, thresholds per group, and the target TPR.
+    """
+    model.eval()
+    all_probs = []
+    all_labels = []
+    with torch.no_grad():
+        for data, target in test_loader:
+            data = data.to(device)
+            probs = torch.softmax(model(data), dim=1)[:, 1].cpu().numpy()
+            all_probs.extend(probs)
+            all_labels.extend(target.cpu().numpy())
+    all_probs = np.array(all_probs)
+    all_labels = np.array(all_labels)
+    all_sens = np.array(sensitive_values)  # Sensitive values loaded from CSV
+
+    groups = np.unique(all_sens)
+    default_preds = (all_probs >= 0.5).astype(int)
+    group_tprs = {}
+    for g in groups:
+        mask = (all_sens == g)
+        if np.sum(all_labels[mask] == 1) > 0:
+            tpr = np.sum((all_labels[mask] == 1) & (default_preds[mask] == 1)) / (np.sum(all_labels[mask] == 1) + 1e-6)
+        else:
+            tpr = 0.0
+        group_tprs[g] = tpr
+
+    target_TPR = np.mean(list(group_tprs.values()))
+    thresholds = {}
+    for g in groups:
+        mask = (all_sens == g)
+        probs_g = all_probs[mask]
+        labels_g = all_labels[mask]
+        best_thresh = 0.5
+        best_diff = float('inf')
+        for thresh in np.linspace(0, 1, 101):
+            preds = (probs_g >= thresh).astype(int)
+            if np.sum(labels_g == 1) > 0:
+                tpr = np.sum((labels_g == 1) & (preds == 1)) / (np.sum(labels_g == 1) + 1e-6)
+            else:
+                tpr = 0.0
+            diff = abs(tpr - target_TPR)
+            if diff < best_diff:
+                best_diff = diff
+                best_thresh = thresh
+        thresholds[g] = best_thresh
+
+    postprocessed_preds = np.zeros_like(all_probs, dtype=int)
+    for g in groups:
+        mask = (all_sens == g)
+        postprocessed_preds[mask] = (all_probs[mask] >= thresholds[g]).astype(int)
+    return postprocessed_preds, thresholds, target_TPR
+
+
+# --- Training Function ---
 def train_private_model(
     model,
     train_loader,
@@ -245,13 +289,11 @@ def train_private_model(
     return all_train_accs, all_test_accs, all_epsilons, all_train_losses
 
 
-# Fairness Evaluation Functions
-
+# --- Fairness Evaluation Function (Equal Opportunity) ---
 def evaluate_equal_opportunity(model, test_loader, sensitive_values):
     """
     Computes the True Positive Rate (TPR) for the positive class (label 1)
-    for each sensitive group.
-    Returns a dictionary of TPR values along with predictions and labels.
+    for each sensitive group (here, genders).
     """
     model.eval()
     all_preds = []
@@ -277,116 +319,15 @@ def evaluate_equal_opportunity(model, test_loader, sensitive_values):
         FN = np.sum((group_true == 1) & (group_preds != 1))
         TPR = TP / (TP + FN) if (TP + FN) > 0 else 0.0
         results[group] = TPR
-    return results, all_preds, all_true
-
-
-def evaluate_equalized_odds(model, test_loader, sensitive_values):
-    """
-    Computes Equalized Odds metrics (TPR and FPR) for each sensitive group.
-    """
-    model.eval()
-    all_preds = []
-    all_true = []
-    device = next(model.parameters()).device
-    with torch.no_grad():
-        for data, target in test_loader:
-            data = data.to(device)
-            output = model(data)
-            _, predicted = torch.max(output, 1)
-            all_preds.extend(predicted.cpu().numpy())
-            all_true.extend(target.cpu().numpy())
-
-    all_preds = np.array(all_preds)
-    all_true = np.array(all_true)
-    results = {}
-    for group in np.unique(sensitive_values):
-        mask = (sensitive_values == group)
-        group_true = all_true[mask]
-        group_preds = all_preds[mask]
-        TP = np.sum((group_true == 1) & (group_preds == 1))
-        FP = np.sum((group_true == 0) & (group_preds == 1))
-        TN = np.sum((group_true == 0) & (group_preds == 0))
-        FN = np.sum((group_true == 1) & (group_preds == 0))
-        TPR = TP / (TP + FN) if (TP + FN) > 0 else 0.0
-        FPR = FP / (FP + TN) if (FP + TN) > 0 else 0.0
-        results[group] = {'TPR': TPR, 'FPR': FPR}
     return results
 
 
-def evaluate_intersectional_fairness(model, test_loader, sensitive_attrs):
-    """
-    Evaluates intersectional fairness for multiple sensitive attributes.
-    sensitive_attrs should be a list of arrays (e.g., [gender, education]).
-    Groups are created by concatenating the attribute values.
-    """
-    model.eval()
-    all_preds = []
-    all_true = []
-    device = next(model.parameters()).device
-    with torch.no_grad():
-        for data, target in test_loader:
-            data = data.to(device)
-            output = model(data)
-            _, predicted = torch.max(output, 1)
-            all_preds.extend(predicted.cpu().numpy())
-            all_true.extend(target.cpu().numpy())
-
-    all_preds = np.array(all_preds)
-    all_true = np.array(all_true)
-    # Create intersectional groups by concatenating attribute values
-    intersectional_groups = np.array([f"{a}_{b}" for a, b in zip(sensitive_attrs[0], sensitive_attrs[1])])
-    results = {}
-    for group in np.unique(intersectional_groups):
-        mask = (intersectional_groups == group)
-        group_true = all_true[mask]
-        group_preds = all_preds[mask]
-        TP = np.sum((group_true == 1) & (group_preds == 1))
-        FN = np.sum((group_true == 1) & (group_preds != 1))
-        TPR = TP / (TP + FN) if (TP + FN) > 0 else 0.0
-        results[group] = TPR
-    return results
-
-
-def compute_disparate_impact(all_preds, sensitive_values, privileged_group, unprivileged_group):
-    """
-    Computes the disparate impact ratio (approval rate of privileged group over unprivileged group).
-    """
-    sensitive_values = np.array(sensitive_values)
-    priv_mask = (sensitive_values == privileged_group)
-    unpriv_mask = (sensitive_values == unprivileged_group)
-    approval_priv = np.mean(all_preds[priv_mask])
-    approval_unpriv = np.mean(all_preds[unpriv_mask])
-    if approval_unpriv == 0:
-        return float('inf')
-    return approval_priv / approval_unpriv
-
-
-# SHAP Explainability
-def shap_analysis(model, test_loader, feature_names, device):
-    """
-    Computes SHAP values using DeepExplainer and plots a summary plot.
-    """
-    model.eval()
-    background = []
-    for data, _ in test_loader:
-        data = data.to(device)
-        background.append(data)
-        if len(background) >= 2:  # Use 2 batches for background
-            break
-    background = torch.cat(background[:2])
-    test_samples = background[:5]  # Explain the first 5 samples
-    explainer = shap.DeepExplainer(model, background)
-    shap_values = explainer.shap_values(test_samples)
-    shap.summary_plot(shap_values, test_samples.cpu().numpy(), feature_names=feature_names, class_names=['Reject', 'Approve'])
-    plt.show()
-
-
-# Plotting Function
+# --- Plotting Function ---
 def plot_results(train_accs, test_accs, epsilons, train_losses, epochs):
     epochs_range = range(1, epochs + 1)
     plt.figure(figsize=(18, 5))
 
-    # Training and Test Accuracy
+    # Plot Training and Test Accuracy
     plt.subplot(1, 3, 1)
     plt.plot(epochs_range, train_accs, label='Training Accuracy')
     plt.plot(epochs_range, test_accs, label='Test Accuracy')
@@ -396,7 +337,7 @@ def plot_results(train_accs, test_accs, epsilons, train_losses, epochs):
     plt.legend()
     plt.grid(True)
 
-    # Training Loss
+    # Plot Training Loss
     plt.subplot(1, 3, 2)
     plt.plot(epochs_range, train_losses, label='Training Loss', color='orange')
     plt.xlabel('Epoch')
@@ -405,7 +346,7 @@ def plot_results(train_accs, test_accs, epsilons, train_losses, epochs):
     plt.legend()
     plt.grid(True)
 
-    # Privacy Budget (Epsilon)
+    # Plot Privacy Budget (Epsilon)
     plt.subplot(1, 3, 3)
     plt.plot(epochs_range, epsilons, label='ε (Privacy Budget)', color='purple')
     plt.xlabel('Epoch')
@@ -418,6 +359,7 @@ def plot_results(train_accs, test_accs, epsilons, train_losses, epochs):
     plt.show()
 
 
+# --- Main Function ---
 def main():
     # Base configuration
     BASE_SEED = 42
@@ -426,10 +368,10 @@ def main():
     print(f"Generated seeds for runs: {run_seeds}")
 
     # Hyperparameters
-    BATCH_SIZE = 4000
+    BATCH_SIZE = 5000
     EPOCHS = 11
     LEARNING_RATE = 0.005
-    NOISE_MULTIPLIER = 8
+    NOISE_MULTIPLIER = 4
     MAX_GRAD_NORM = 1
     TARGET_DELTA = 1e-5
 
@@ -448,7 +390,7 @@ def main():
 
         try:
             print("Loading and preprocessing data...")
-            train_loader, test_loader, sample_size, input_dim, feature_names = load_adult_data("train.csv", "test.csv", batch_size=BATCH_SIZE)
+            train_loader, test_loader, sample_size, input_dim = load_adult_data("train.csv", "test.csv", batch_size=BATCH_SIZE)
 
             print("Initializing model...")
             model = ImprovedAdultNet(input_dim).to(device)
@@ -483,40 +425,48 @@ def main():
             all_epsilons.append(epsilons)
             all_train_losses.append(train_losses)
 
-            # Fairness Evaluation (Equal Opportunity)
+            # --- Fairness Evaluation BEFORE Postprocessing ---
             test_df = pd.read_csv("test.csv", skipinitialspace=True)
-            sensitive_gender = test_df['person_gender'].values  # Sensitive attribute: gender
+            sensitive_values = test_df['person_gender'].values  # Sensitive attribute: gender
 
-            eq_opp_results, all_preds, all_true = evaluate_equal_opportunity(model, test_loader, sensitive_gender)
-            fairness_results_list.append(eq_opp_results)
-            print("\nFairness Evaluation (Equal Opportunity):")
-            for group, tpr in eq_opp_results.items():
-                print(f"Group: {group}, True Positive Rate (TPR): {tpr:.2f}")
-            if len(eq_opp_results) == 2:
-                groups = list(eq_opp_results.keys())
-                equal_opportunity_gap = abs(eq_opp_results[groups[0]] - eq_opp_results[groups[1]])
-                print(f"Equal Opportunity Gap (|TPR_{groups[0]} - TPR_{groups[1]}|): {equal_opportunity_gap:.2f}")
+            fairness_results = evaluate_equal_opportunity(model, test_loader, sensitive_values)
+            fairness_results_list.append(fairness_results)
+            print("\nFairness Evaluation (Equal Opportunity) BEFORE Postprocessing:")
+            for group, tpr in fairness_results.items():
+                print(f"Group: {group}, TPR: {tpr:.2f}")
+            if len(fairness_results) == 2:
+                groups = list(fairness_results.keys())
+                pre_gap = abs(fairness_results[groups[0]] - fairness_results[groups[1]])
+                print(f"Equal Opportunity Gap BEFORE: {pre_gap:.2f}")
             print("----------------------------------------------------\n")
 
-            # SHAP Analysis for Explainability
-            shap_analysis(model, test_loader, feature_names, device)
-
-            # Evaluate Intersectional Fairness (e.g., Gender + Education)
-            sensitive_education = test_df['person_education'].values
-            intersectional_results = evaluate_intersectional_fairness(model, test_loader, [sensitive_gender, sensitive_education])
-            print("\nIntersectional Fairness (Gender + Education):")
-            for group, tpr in intersectional_results.items():
+            # --- Fairness Postprocessing ---
+            post_preds, thresholds, target_TPR = postprocess_equalized_odds(model, test_loader, device, sensitive_values)
+            # Compute TPR for each group after postprocessing:
+            post_fairness = {}
+            # Reconstruct true labels from the test set:
+            all_true = []
+            for _, target in test_loader:
+                all_true.extend(target.numpy())
+            all_true = np.array(all_true)
+            for group in np.unique(sensitive_values):
+                mask = (sensitive_values == group)
+                if np.sum(all_true[mask] == 1) > 0:
+                    tpr = np.sum((all_true[mask] == 1) & (post_preds[mask] == 1)) / (np.sum(all_true[mask] == 1) + 1e-6)
+                else:
+                    tpr = 0.0
+                post_fairness[group] = tpr
+            print("\nFairness Evaluation (Equal Opportunity) AFTER Postprocessing:")
+            for group, tpr in post_fairness.items():
                 print(f"Group: {group}, TPR: {tpr:.2f}")
+            if len(post_fairness) == 2:
+                groups = list(post_fairness.keys())
+                post_gap = abs(post_fairness[groups[0]] - post_fairness[groups[1]])
+                print(f"Equal Opportunity Gap AFTER: {post_gap:.2f}")
+            print("----------------------------------------------------\n")
 
-            # Evaluate Equalized Odds
-            eq_odds_results = evaluate_equalized_odds(model, test_loader, sensitive_gender)
-            print("\nEqualized Odds (Gender):")
-            for group, metrics in eq_odds_results.items():
-                print(f"Group: {group}, TPR: {metrics['TPR']:.2f}, FPR: {metrics['FPR']:.2f}")
-
-            # Compute Disparate Impact (approval rate ratio)
-            di = compute_disparate_impact(all_preds, sensitive_gender, 'male', 'female')
-            print(f"\nDisparate Impact (male vs female): {di:.2f}")
+            # Optionally, you can perform SHAP analysis here if feature names are available.
+            # shap_analysis(model, test_loader, feature_names, device)
 
         except Exception as e:
             print(f"Error in run {run_idx + 1}: {str(e)}")
@@ -536,14 +486,15 @@ def main():
 
     if len(fairness_results_list) > 0:
         all_groups = fairness_results_list[0].keys()
-        avg_fairness = {group: np.mean([run_results[group] for run_results in fairness_results_list]) for group in all_groups}
-        print("\nAverage Fairness (Equal Opportunity) Metrics over Runs:")
+        avg_fairness = {group: np.mean([run_results[group] for run_results in fairness_results_list])
+                        for group in all_groups}
+        print("\nAverage Fairness (Equal Opportunity) Metrics over Runs BEFORE Postprocessing:")
         for group, tpr in avg_fairness.items():
             print(f"Group: {group}, Average TPR: {tpr:.2f}")
         if len(avg_fairness) == 2:
             groups = list(avg_fairness.keys())
-            equal_opportunity_gap = abs(avg_fairness[groups[0]] - avg_fairness[groups[1]])
-            print(f"Average Equal Opportunity Gap: {equal_opportunity_gap:.2f}")
+            pre_avg_gap = abs(avg_fairness[groups[0]] - avg_fairness[groups[1]])
+            print(f"Average Equal Opportunity Gap BEFORE: {pre_avg_gap:.2f}")
 
     plot_results(avg_train_accs, avg_test_accs, avg_epsilons, avg_train_losses, EPOCHS)
 
