@@ -405,7 +405,7 @@ def main():
                 data_loader=train_loader,
                 noise_multiplier=NOISE_MULTIPLIER,
                 max_grad_norm=MAX_GRAD_NORM,
-                poisson_sampling=False,
+                poisson_sampling=True,
             )
 
             print("Starting DP training...")
