@@ -301,7 +301,7 @@ def main():
     print(f"Generated seeds for runs: {run_seeds}")
 
     # Hyperparameters
-    BATCH_SIZE = 512
+    BATCH_SIZE = 6000
     EPOCHS = 50
     LEARNING_RATE = 0.005
 

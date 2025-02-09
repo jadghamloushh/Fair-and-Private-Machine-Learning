@@ -319,9 +319,9 @@ def main():
     print(f"Generated seeds for runs: {run_seeds}")
 
     # Hyperparameters
-    BATCH_SIZE = 512
-    EPOCHS = 10
-    LEARNING_RATE = 0.001
+    BATCH_SIZE = 6000
+    EPOCHS = 20
+    LEARNING_RATE = 0.005
     NOISE_MULTIPLIER = 8
     MAX_GRAD_NORM = 1.2
     TARGET_DELTA = 1e-5
@@ -356,6 +356,7 @@ def main():
                 data_loader=train_loader,
                 noise_multiplier=NOISE_MULTIPLIER,
                 max_grad_norm=MAX_GRAD_NORM,
+                poisson_sampling=False,
             )
 
             print("Starting DP training...")
@@ -376,7 +377,6 @@ def main():
             all_train_losses.append(train_losses)
 
             # --- Fairness Evaluation (Equal Opportunity) ---
-            # Re-read the test CSV to get sensitive attribute values
             test_df = pd.read_csv("test.csv", skipinitialspace=True)
             sensitive_values = test_df['person_gender'].values  # sensitive variable: gender
 
@@ -401,10 +401,15 @@ def main():
     avg_train_accs = np.mean(all_train_accuracies, axis=0)
     avg_test_accs = np.mean(all_test_accuracies, axis=0)
     avg_train_losses = np.mean(all_train_losses, axis=0)
+    # Squeeze to ensure the shape is (EPOCHS,) not (1, EPOCHS)
+    avg_epsilons = np.squeeze(np.mean(all_epsilons, axis=0))
 
     print("\nFinal Results:")
-    print(f"Average Train Accuracy: {avg_train_accs[-1]:.2f}%")
-    print(f"Average Test Accuracy: {avg_test_accs[-1]:.2f}%")
+    # If only one run, these will be scalars
+    print("Average Train Accuracy:", avg_train_accs)
+    print("Average Test Accuracy:", avg_test_accs)
+    print("Final Privacy Budget (ε):", avg_epsilons)
+
 
     # Average fairness metrics over runs
     if len(fairness_results_list) > 0:
