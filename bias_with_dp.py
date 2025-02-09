@@ -319,11 +319,11 @@ def main():
     print(f"Generated seeds for runs: {run_seeds}")
 
     # Hyperparameters
-    BATCH_SIZE = 6000
-    EPOCHS = 20
+    BATCH_SIZE = 4000
+    EPOCHS = 11
     LEARNING_RATE = 0.005
     NOISE_MULTIPLIER = 8
-    MAX_GRAD_NORM = 1.2
+    MAX_GRAD_NORM = 1
     TARGET_DELTA = 1e-5
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -333,7 +333,7 @@ def main():
     all_test_accuracies = []
     all_epsilons = []
     all_train_losses = []
-    fairness_results_list = []  # To collect fairness metrics from each run
+    fairness_results_list = []
 
     for run_idx, run_seed in enumerate(run_seeds):
         print(f'\nRun {run_idx + 1}/{NUM_RUNS} (Seed: {run_seed})')

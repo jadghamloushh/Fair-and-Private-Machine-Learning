@@ -93,15 +93,15 @@ class LoanNet(nn.Module):
         # Fully connected network with dropout and ReLU activation
         self.fc1 = nn.Linear(input_dim, 256)
         self.norm1 = nn.LayerNorm(256)
-        self.dropout1 = nn.Dropout(0.3)
+        self.dropout1 = nn.Dropout(0)
 
         self.fc2 = nn.Linear(256, 128)
         self.norm2 = nn.LayerNorm(128)
-        self.dropout2 = nn.Dropout(0.2)
+        self.dropout2 = nn.Dropout(0)
 
         self.fc3 = nn.Linear(128, 64)
         self.norm3 = nn.LayerNorm(64)
-        self.dropout3 = nn.Dropout(0.1)
+        self.dropout3 = nn.Dropout(0)
 
         # Output layer: 2 neurons for binary classification
         self.fc_out = nn.Linear(64, 2)
@@ -153,7 +153,7 @@ def load_loan_data(train_file: str, test_file: str, batch_size: int = 512):
 # -------------------------------
 # Training Function
 # -------------------------------
-def train_model(model, train_loader, test_loader, optimizer, epochs: int = 50,
+def train_model(model, train_loader, test_loader, optimizer, scheduler, epochs: int = 50,
                 device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")):
     model = model.to(device)
     criterion = nn.CrossEntropyLoss()
@@ -217,7 +217,13 @@ def train_model(model, train_loader, test_loader, optimizer, epochs: int = 50,
         all_train_accs.append(train_acc)
         all_test_accs.append(test_acc)
 
-        print(f'Epoch: {epoch+1}, Train Acc: {train_acc:.2f}%, Test Acc: {test_acc:.2f}%, Loss: {avg_epoch_loss:.3f}')
+        # Print current epoch results along with current learning rate:
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f'Epoch: {epoch+1}, Train Acc: {train_acc:.2f}%, Test Acc: {test_acc:.2f}%, '
+              f'Loss: {avg_epoch_loss:.3f}, LR: {current_lr:.6f}')
+
+        # Step the scheduler at the end of the epoch
+        scheduler.step()
 
         # Save best model state
         if test_acc > best_acc:
@@ -301,7 +307,7 @@ def main():
     print(f"Generated seeds for runs: {run_seeds}")
 
     # Hyperparameters
-    BATCH_SIZE = 6000
+    BATCH_SIZE = 4000
     EPOCHS = 50
     LEARNING_RATE = 0.005
 
@@ -326,12 +332,16 @@ def main():
 
             optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, eps=1e-8)
 
+            scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.5)
+
+
             print("Starting training...")
             train_accs, test_accs, train_losses = train_model(
                 model,
                 train_loader,
                 test_loader,
                 optimizer,
+                scheduler,
                 epochs=EPOCHS,
                 device=device
             )
@@ -340,10 +350,9 @@ def main():
             all_test_accuracies.append(test_accs)
             all_train_losses.append(train_losses)
 
-            # --- Fairness Evaluation (Equal Opportunity) ---
-            # Re-read the test CSV to obtain the sensitive attribute values in the same order.
+
             test_df = pd.read_csv("test.csv", skipinitialspace=True)
-            sensitive_values = test_df['person_gender'].values  # sensitive attribute: gender
+            sensitive_values = test_df['person_gender'].values
 
             fairness_results = evaluate_equal_opportunity(model, test_loader, sensitive_values)
             fairness_results_list.append(fairness_results)
@@ -371,7 +380,6 @@ def main():
     print(f"Average Train Accuracy: {avg_train_accs[-1]:.2f}%")
     print(f"Average Test Accuracy: {avg_test_accs[-1]:.2f}%")
 
-    # If multiple runs, average fairness metrics group-wise.
     if len(fairness_results_list) > 0:
         all_groups = fairness_results_list[0].keys()
         avg_fairness = {group: np.mean([run_results[group] for run_results in fairness_results_list]) for group in all_groups}
