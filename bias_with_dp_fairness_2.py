@@ -21,7 +21,6 @@ from aif360.algorithms.postprocessing import CalibratedEqOddsPostprocessing
 
 from sklearn.preprocessing import MinMaxScaler, OneHotEncoder
 
-
 def set_all_seeds(seed):
     """Set all seeds for reproducibility."""
     os.environ['PYTHONHASHSEED'] = str(seed)
@@ -32,7 +31,6 @@ def set_all_seeds(seed):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-
 
 def generate_run_seeds(base_seed: int, num_runs: int) -> List[int]:
     random.seed(base_seed)
@@ -55,7 +53,6 @@ class AdultDataset(Dataset):
 
     def __getitem__(self, idx):
         return self.features[idx], self.labels[idx]
-
 
 def preprocess_loan_data(df: pd.DataFrame) -> (np.ndarray, np.ndarray, int):
     """
@@ -99,10 +96,8 @@ def preprocess_loan_data(df: pd.DataFrame) -> (np.ndarray, np.ndarray, int):
 
     # Target
     y = df['loan_status'].values.astype(np.int64)
-
     input_dim = X.shape[1]
     return X, y, input_dim
-
 
 def load_adult_data(train_file: str, test_file: str, batch_size: int = 512):
     train_df = pd.read_csv(train_file, skipinitialspace=True)
@@ -118,7 +113,6 @@ def load_adult_data(train_file: str, test_file: str, batch_size: int = 512):
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, pin_memory=True)
 
     return train_loader, test_loader, len(train_dataset), input_dim
-
 
 # ------------------
 # Model
@@ -142,7 +136,6 @@ class ImprovedAdultNet(nn.Module):
         self.dropout3 = nn.Dropout(0.1)
 
         self.fc_out = nn.Linear(64, 2)
-
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
@@ -164,7 +157,6 @@ class ImprovedAdultNet(nn.Module):
         x = self.dropout3(x)
         out = self.fc_out(x)
         return out
-
 
 # ------------------
 # DP Training
@@ -222,6 +214,7 @@ def train_private_model(
         avg_epoch_loss = epoch_loss / num_batches
         all_train_losses.append(avg_epoch_loss)
 
+        # Evaluate
         model.eval()
         correct_test = 0
         total_test = 0
@@ -329,7 +322,7 @@ def plot_results(train_accs, test_accs, epsilons, train_losses, epochs):
 
 
 # ------------------
-# AIF360 Post-Processing (CalibratedEqOdds) for Equal Opportunity
+# AIF360 Post-Processing for Equal Opportunity
 # ------------------
 
 def aif360_equal_opportunity_postprocess(model, test_loader, test_df, device):
@@ -339,56 +332,59 @@ def aif360_equal_opportunity_postprocess(model, test_loader, test_df, device):
     from the DP model, then let AIF360 adjust them to reduce TPR gap.
     """
     model.eval()
-
     all_probs = []
     all_labels = []
     with torch.no_grad():
         for data, target in test_loader:
             data = data.to(device)
             logits = model(data)
-            probs = torch.softmax(logits, dim=1)[:, 1]  # prob for class=1
+            # Probability of class=1
+            probs = torch.softmax(logits, dim=1)[:, 1]
             all_probs.append(probs.cpu().numpy())
             all_labels.append(target.cpu().numpy())
 
     all_probs = np.concatenate(all_probs)
-    all_labels = np.concatenate(all_labels)
+    all_labels= np.concatenate(all_labels)
 
     # Convert 'male'/'female' to numeric 0/1
     sens_attr_str = test_df['person_gender'].values
-    sens_attr = np.where(sens_attr_str == 'male', 1, 0)
+    sens_attr = np.where(sens_attr_str=='male', 1, 0)
 
-    # Build an empty BinaryLabelDataset and set arrays afterwards
+    # 1) Construct a minimal DataFrame for AIF360
+    import pandas as pd
+    df_for_aif = pd.DataFrame({
+        "label": all_labels,   # ground truth label
+        "gender": sens_attr    # protected attribute
+    })
+
+    # 2) Build a BinaryLabelDataset with df=...
     bld_test = BinaryLabelDataset(
-        df=None,
+        df=df_for_aif,
         label_names=['label'],
         protected_attribute_names=['gender'],
-        unprivileged_protected_attributes=[[0]],
-        privileged_protected_attributes=[[1]],
+        unprivileged_protected_attributes=[[0]],  # 'female' => 0
+        privileged_protected_attributes=[[1]],    # 'male' => 1
         favorable_label=1.0,
-        unfavorable_label=0.0,
+        unfavorable_label=0.0
     )
 
-    # Now manually assign arrays
-    n = len(all_labels)
-    bld_test.labels = all_labels.reshape(-1,1)
-    bld_test.protected_attributes = sens_attr.reshape(-1,1)
+    # 3) We can store predicted probabilities in .scores
     bld_test.scores = all_probs.reshape(-1,1)
-    # We don't actually need real features for postprocessing, so store dummy
-    bld_test.features = np.zeros((n,1), dtype=np.float32)
 
-    # cost_constraint='fnr' => tries to align TPR => Equal Opportunity
-    cpp = CalibratedEqOddsPostprocessing(
-        unprivileged_groups=[{'gender': 0}],  # female=0
-        privileged_groups=[{'gender': 1}],    # male=1
-        cost_constraint='fnr',
+    # 4) Initialize CalibratedEqOddsPostprocessing
+    from aif360.algorithms.postprocessing import CalibratedEqOddsPostprocessing
+    postproc = CalibratedEqOddsPostprocessing(
+        unprivileged_groups=[{'gender': 0}],
+        privileged_groups=[{'gender': 1}],
+        cost_constraint='fnr',  # tries to align TPR => Equal Opportunity
         seed=42
     )
 
-    # Fit on the same dataset for demonstration
-    cpp.fit(bld_test, bld_test)
+    # Fit on the same dataset (for demonstration)
+    postproc.fit(bld_test, bld_test)
 
     # Transform => new predictions
-    bld_test_transf = cpp.predict(bld_test)
+    bld_test_transf = postproc.predict(bld_test)
     new_preds = bld_test_transf.labels.ravel()
 
     # Evaluate TPR gap
@@ -429,6 +425,12 @@ def main():
     all_test_accuracies = []
     all_epsilons = []
     all_train_losses = []
+
+    # Variables to store the final "raw" gap and "fair" gap:
+    raw_gap_final = None
+    raw_acc_final = None
+    fair_gap_final = None
+    fair_acc_final = None
 
     for run_idx, run_seed in enumerate(run_seeds):
         print(f'\nRun {run_idx + 1}/{NUM_RUNS} (Seed: {run_seed})')
@@ -474,6 +476,9 @@ def main():
         all_epsilons.append(epsilons)
         all_train_losses.append(train_losses)
 
+        # (the final test_acc after last epoch is test_accs[-1])
+        raw_acc_final = test_accs[-1]  # store the final "raw" accuracy
+
         # 4) Evaluate TPR gap BEFORE
         test_df = pd.read_csv("test.csv", skipinitialspace=True)
         sensitive_values = test_df['person_gender'].values
@@ -485,6 +490,7 @@ def main():
         print("\nFairness (Equal Opportunity) BEFORE mitigation:")
         print(f"  TPR Female: {female_tpr_before:.2f}, TPR Male: {male_tpr_before:.2f}")
         print(f"  TPR Gap BEFORE: {gap_before:.2f}")
+        raw_gap_final = gap_before  # store the final "raw" gap
 
         # 5) AIF360 post-process => reduce TPR gap
         print("\nApplying AIF360 CalibratedEqOddsPostprocessing (cost_constraint='fnr') for Equal Opportunity...")
@@ -500,8 +506,11 @@ def main():
         print(f"  TPR Gap AFTER: {gap_after:.2f}")
         print(f"  Accuracy AFTER mitigation: {acc_after:.2f}")
 
+        fair_gap_final = gap_after   # store the final "fair" gap
+        fair_acc_final = acc_after   # store the final "fair" accuracy
 
-    # 6) Final results across runs
+
+    # 6) Summaries across runs
     avg_train_accs = np.mean(all_train_accuracies, axis=0)
     avg_test_accs  = np.mean(all_test_accuracies, axis=0)
     avg_train_losses = np.mean(all_train_losses, axis=0)
@@ -511,6 +520,13 @@ def main():
     print("Average Train Accuracy:", avg_train_accs)
     print("Average Test Accuracy:",  avg_test_accs)
     print("Final Privacy Budget (ε):", avg_epsilons)
+
+    # Example: Print final raw vs. fair metrics from the last run
+    print("\n--- Comparison of Raw vs. Post-Processed Fairness ---")
+    print(f"Raw Test Accuracy (No fairness fix): {raw_acc_final:.2f}")
+    print(f"Raw TPR Gap: {raw_gap_final:.2f}")
+    print(f"Fair Test Accuracy (Post-Processed): {fair_acc_final:.2f}")
+    print(f"Fair TPR Gap: {fair_gap_final:.2f}")
 
     plot_results(avg_train_accs, avg_test_accs, avg_epsilons, avg_train_losses, EPOCHS)
 
