@@ -54,12 +54,20 @@ class AdultDataset(Dataset):
     def __getitem__(self, idx):
         return self.features[idx], self.labels[idx]
 
-def preprocess_loan_data(df: pd.DataFrame) -> (np.ndarray, np.ndarray, int):
+def preprocess_loan_data_train(df: pd.DataFrame) -> (np.ndarray, np.ndarray, int, MinMaxScaler, OneHotEncoder):
     """
-    Preprocess the loan data from a DataFrame:
-      - numeric features scaled
-      - categorical features one-hot
-      - target in column 'loan_status'
+    Preprocess the training data:
+      - Convert numeric columns to numbers and fill missing values.
+      - Fill missing values for categorical columns.
+      - Fit a MinMaxScaler on numeric features.
+      - Fit a OneHotEncoder on categorical features.
+      - Concatenate the processed features.
+    Returns:
+      - X: Preprocessed features.
+      - y: Labels.
+      - input_dim: Number of features.
+      - scaler: Fitted MinMaxScaler (for later use on test data).
+      - ohe: Fitted OneHotEncoder (for later use on test data).
     """
     df = df.copy()
 
@@ -73,38 +81,89 @@ def preprocess_loan_data(df: pd.DataFrame) -> (np.ndarray, np.ndarray, int):
         'loan_intent', 'previous_loan_defaults_on_file'
     ]
 
-    # Numeric columns
+    # Process numeric features: convert and fill missing values.
     for col in numeric_features:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce')
             df[col].fillna(df[col].median(), inplace=True)
 
-    # Categorical columns
+    # Process categorical features: fill missing values.
     for col in categorical_features:
         df[col].fillna(df[col].mode()[0], inplace=True)
 
-    # Scale numeric
+    # Fit scaler and transform numeric features.
     scaler = MinMaxScaler()
     X_numeric = scaler.fit_transform(df[numeric_features])
 
-    # One-hot encode categorical
+    # Fit encoder and transform categorical features.
     ohe = OneHotEncoder(handle_unknown='ignore', sparse_output=False)
     X_categorical = ohe.fit_transform(df[categorical_features])
 
-    # Concatenate
+    # Concatenate numeric and categorical features.
     X = np.hstack([X_numeric, X_categorical])
-
-    # Target
     y = df['loan_status'].values.astype(np.int64)
     input_dim = X.shape[1]
+
+    return X, y, input_dim, scaler, ohe
+
+
+def preprocess_loan_data_test(df: pd.DataFrame, scaler: MinMaxScaler, ohe: OneHotEncoder) -> (np.ndarray, np.ndarray, int):
+    """
+    Preprocess the test data using the scaler and encoder fitted on the training data.
+      - Convert numeric columns to numbers and fill missing values.
+      - Fill missing values for categorical features.
+      - Transform numeric features using the provided scaler.
+      - Transform categorical features using the provided encoder.
+      - Concatenate the processed features.
+    Returns:
+      - X: Preprocessed features.
+      - y: Labels.
+      - input_dim: Number of features.
+    """
+    df = df.copy()
+
+    numeric_features = [
+        'person_age', 'person_income', 'person_emp_exp',
+        'loan_amnt', 'loan_int_rate', 'loan_percent_income',
+        'cb_person_cred_hist_length', 'credit_score'
+    ]
+    categorical_features = [
+        'person_gender', 'person_education', 'person_home_ownership',
+        'loan_intent', 'previous_loan_defaults_on_file'
+    ]
+
+    # Process numeric features: convert and fill missing values.
+    for col in numeric_features:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+            df[col].fillna(df[col].median(), inplace=True)
+
+    # Process categorical features: fill missing values.
+    for col in categorical_features:
+        df[col].fillna(df[col].mode()[0], inplace=True)
+
+    # Transform numeric and categorical features using the provided scaler and encoder.
+    X_numeric = scaler.transform(df[numeric_features])
+    X_categorical = ohe.transform(df[categorical_features])
+
+    # Concatenate numeric and categorical features.
+    X = np.hstack([X_numeric, X_categorical])
+    y = df['loan_status'].values.astype(np.int64)
+    input_dim = X.shape[1]
+
     return X, y, input_dim
+
+
 
 def load_adult_data(train_file: str, test_file: str, batch_size: int = 512):
     train_df = pd.read_csv(train_file, skipinitialspace=True)
     test_df = pd.read_csv(test_file, skipinitialspace=True)
 
-    X_train, y_train, input_dim = preprocess_loan_data(train_df)
-    X_test, y_test, _ = preprocess_loan_data(test_df)
+    # Preprocess training data (fitting the scaler and encoder)
+    X_train, y_train, input_dim, scaler, ohe = preprocess_loan_data_train(train_df)
+
+    # Preprocess test data using the fitted scaler and encoder
+    X_test, y_test, _ = preprocess_loan_data_test(test_df, scaler, ohe)
 
     train_dataset = AdultDataset(X_train, y_train)
     test_dataset = AdultDataset(X_test, y_test)
@@ -113,6 +172,7 @@ def load_adult_data(train_file: str, test_file: str, batch_size: int = 512):
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, pin_memory=True)
 
     return train_loader, test_loader, len(train_dataset), input_dim
+
 
 # ------------------
 # Model
