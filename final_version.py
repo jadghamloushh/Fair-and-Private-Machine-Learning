@@ -125,7 +125,15 @@ egr.fit(
     sensitive_features=sensitive_train
 )
 
+# Calculate training accuracy
+y_train_pred = egr.predict(X_train_preprocessed)
+train_accuracy = np.mean(y_train == y_train_pred)
+print(f"\nTraining Accuracy: {train_accuracy:.4f}")
+
+# Calculate testing accuracy
 y_pred = egr.predict(X_test_preprocessed)
+test_accuracy = np.mean(y_test == y_pred)
+print(f"Testing Accuracy: {test_accuracy:.4f}")
 
 # Get probability predictions for ROC curves and TPR analysis
 def get_egr_probas(egr_model, X):

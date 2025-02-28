@@ -25,7 +25,7 @@ def load_data(file_path):
     data['person_gender'] = data['person_gender'].map({'male': 1, 'female': 0})
     y = data['loan_status'].values
     sensitive = data['person_gender'].values
-    X = data.drop(columns=['loan_status', 'person_gender'])
+    X = data.drop(columns=['loan_status'])
     return X, y, sensitive
 
 # Load and split data
@@ -57,7 +57,7 @@ l2_norm_clip = 1.0
 batch_size = 250
 epochs = 60
 microbatches = 25
-learning_rate = 0.1
+learning_rate = 0.15
 
 # Build the DP model
 print("\nTraining DP Model...")
