@@ -3,10 +3,21 @@ from tensorflow_privacy.privacy.optimizers.dp_optimizer_keras import DPKerasSGDO
 import numpy as np
 from tensorflow_privacy.privacy.analysis import compute_dp_sgd_privacy_lib
 import pandas as pd
+import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.compose import ColumnTransformer
 from fairlearn.metrics import demographic_parity_difference, equalized_odds_difference
+from sklearn.metrics import confusion_matrix, classification_report
+import random
+
+
+
+random.seed(42)
+np.random.seed(42)
+tf.random.set_seed(42)
+tf.keras.utils.set_random_seed(42)  # TF 2.7+ comprehensive seeding
+tf.config.experimental.enable_op_determinism()
 
 # Data loading function
 def load_data(file_path):
@@ -40,13 +51,13 @@ X_train_preprocessed = preprocessor.fit_transform(X_train)
 X_val_preprocessed = preprocessor.transform(X_val)
 X_test_preprocessed = preprocessor.transform(X_test)
 
-# Define DP parameters
+# Define DP para#meters
 noise_multiplier = 2.0
 l2_norm_clip = 1.0
 batch_size = 250
 epochs = 60
 microbatches = 25
-learning_rate = 0.15
+learning_rate = 0.1
 
 # Build the DP model
 print("\nTraining DP Model...")
@@ -95,13 +106,34 @@ epsilon = compute_dp_sgd_privacy_lib.compute_dp_sgd_privacy(
 print(f"\nPrivacy Budget:")
 print(f"ε = {epsilon:.2f} (with δ = {delta})")
 
-# Get predictions
+# Get predictions for training, validation, and test sets
+y_train_pred_probs = model.predict(X_train_preprocessed).flatten()
+y_train_pred = (y_train_pred_probs >= 0.5).astype(int)
+y_val_pred_probs = model.predict(X_val_preprocessed).flatten()
+y_val_pred = (y_val_pred_probs >= 0.5).astype(int)
 y_test_pred_probs = model.predict(X_test_preprocessed).flatten()
 y_test_pred = (y_test_pred_probs >= 0.5).astype(int)
 
+# Calculate train and test accuracy
+train_accuracy = np.mean(y_train == y_train_pred)
+val_accuracy = np.mean(y_val == y_val_pred)
+test_accuracy = np.mean(y_test == y_test_pred)
+
+print(f"\nModel Accuracy:")
+print(f"Training Accuracy: {train_accuracy:.4f}")
+print(f"Validation Accuracy: {val_accuracy:.4f}")
+print(f"Testing Accuracy: {test_accuracy:.4f}")
+
+# Function to calculate TPR (Recall for positive class)
+def calculate_tpr(y_true, y_pred):
+    cm = confusion_matrix(y_true, y_pred)
+    tp = cm[1, 1]  # True Positives
+    fn = cm[1, 0]  # False Negatives
+    tpr = tp / (tp + fn) if (tp + fn) > 0 else 0
+    return tpr
+
 # Evaluate model
 def evaluate_model(y_true, y_pred, sensitive_features):
-    accuracy = np.mean(y_true == y_pred)
     dp_diff = demographic_parity_difference(
         y_true=y_true,
         y_pred=y_pred,
@@ -120,18 +152,92 @@ def evaluate_model(y_true, y_pred, sensitive_features):
     male_accuracy = np.mean(y_true[male_mask] == y_pred[male_mask])
     female_accuracy = np.mean(y_true[female_mask] == y_pred[female_mask])
     
+    # Calculate TPR for men and women
+    male_tpr = calculate_tpr(y_true[male_mask], y_pred[male_mask])
+    female_tpr = calculate_tpr(y_true[female_mask], y_pred[female_mask])
+    tpr_diff = abs(male_tpr - female_tpr)
+    
     print("\nDP Model Metrics:")
-    print(f"Overall Accuracy: {accuracy:.4f}")
     print(f"Demographic Parity Difference: {dp_diff:.4f}")
     print(f"Equalized Odds Difference: {eo_diff:.4f}")
     print(f"Male Accuracy: {male_accuracy:.4f}")
     print(f"Female Accuracy: {female_accuracy:.4f}")
     print(f"Accuracy Gap: {abs(male_accuracy - female_accuracy):.4f}")
+    
+    print("\nTrue Positive Rate (TPR) Analysis:")
+    print(f"Male TPR: {male_tpr:.4f}")
+    print(f"Female TPR: {female_tpr:.4f}")
+    print(f"TPR Difference (gender bias measure): {tpr_diff:.4f}")
 
     # Add prediction distribution analysis
     print("\nPrediction Analysis:")
     print(f"Mean prediction probability: {np.mean(y_test_pred_probs):.4f}")
     print(f"Prediction distribution: {np.bincount(y_pred)}")
+    
+    # Print classification reports
+    print("\nClassification Report for Men:")
+    print(classification_report(y_true[male_mask], y_pred[male_mask]))
+    
+    print("\nClassification Report for Women:")
+    print(classification_report(y_true[female_mask], y_pred[female_mask]))
+    
+    # Plot TPR comparison
+    plt.figure(figsize=(8, 6))
+    bars = plt.bar(['Men', 'Women'], [male_tpr, female_tpr], color=['blue', 'red'])
+    plt.title('DP Model: True Positive Rate Comparison by Gender')
+    plt.ylabel('True Positive Rate')
+    plt.ylim(0, 1.0)
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    
+    # Add labels on top of bars
+    for bar in bars:
+        height = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width()/2., height + 0.01,
+                 f'{height:.4f}', ha='center', va='bottom', fontweight='bold')
+    
+    plt.show()
+    
+    return male_tpr, female_tpr
 
-# Evaluate the model
-evaluate_model(y_test, y_test_pred, sensitive_test)
+# Evaluate the model and get TPR values
+male_tpr, female_tpr = evaluate_model(y_test, y_test_pred, sensitive_test)
+
+# Plot training and validation metrics (from history)
+plt.figure(figsize=(10, 6))
+plt.plot(history.history['loss'], label='Training Loss')
+plt.plot(history.history['val_loss'], label='Validation Loss')
+plt.title('DP Model Loss over Epochs')
+plt.xlabel('Epochs')
+plt.ylabel('Loss')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+plt.figure(figsize=(10, 6))
+plt.plot(history.history['accuracy'], label='Training Accuracy')
+plt.plot(history.history['val_accuracy'], label='Validation Accuracy')
+plt.title('DP Model Accuracy over Epochs')
+plt.xlabel('Epochs')
+plt.ylabel('Accuracy')
+plt.legend()
+plt.grid(True)
+plt.ylim(0.5, 1.0)
+plt.show()
+
+# Plot final accuracy comparison between train, validation, and test sets
+plt.figure(figsize=(10, 6))
+accuracy_bars = plt.bar(['Training', 'Validation', 'Testing'], 
+                        [train_accuracy, val_accuracy, test_accuracy],
+                        color=['blue', 'green', 'orange'])
+plt.title('DP Model: Final Accuracy Comparison')
+plt.ylabel('Accuracy')
+plt.ylim(0, 1.0)
+plt.grid(axis='y', linestyle='--', alpha=0.7)
+
+# Add labels on top of bars
+for bar in accuracy_bars:
+    height = bar.get_height()
+    plt.text(bar.get_x() + bar.get_width()/2., height + 0.01,
+             f'{height:.4f}', ha='center', va='bottom', fontweight='bold')
+
+plt.show()
